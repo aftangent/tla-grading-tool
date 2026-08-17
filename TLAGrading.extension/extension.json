@@ -1,0 +1,9 @@
+{
+    "type": "extension",
+    "name": "TLA Grading Tool",
+    "description": "CAD elevation import and Toposolid grading creation for Revit",
+    "author": "TLA",
+    "url": "https://github.com/aftangent/tla-grading-tool",
+    "website": "",
+    "image": ""
+}
