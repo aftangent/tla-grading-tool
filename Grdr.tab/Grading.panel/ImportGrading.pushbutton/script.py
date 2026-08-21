@@ -169,6 +169,39 @@ try:
         forms.alert("No points selected.", ok=True)
         script.exit()
 
+    SKIP_LABEL   = "[ Skip - use raw DXF elevations (manual align later) ]"
+    CUSTOM_LABEL = "[ Enter custom reference value... ]"
+    ref_options = [SKIP_LABEL, CUSTOM_LABEL] + [
+        "{} {:.3f} m  (x={:.0f}, y={:.0f})".format(
+            pt["prefix"], pt["value"], pt["x"], pt["y"])
+        for pt in confirmed]
+    ref_chosen = forms.SelectFromList.show(
+        ref_options,
+        title="Select 0 mm Reference Point",
+        message="Pick a point that equals 0 mm in Revit, enter a custom value, or skip.",
+        multiselect=False)
+    if not ref_chosen: script.exit()
+
+    if ref_chosen == SKIP_LABEL:
+        ref_value = 0.0
+    elif ref_chosen == CUSTOM_LABEL:
+        custom_str = forms.ask_for_string(
+            prompt="Enter the DXF elevation (in metres) that equals 0 mm in Revit.\nExample: 35.140",
+            title="Custom Reference Value",
+            default="")
+        if custom_str is None: script.exit()
+        try:
+            ref_value = float(custom_str.strip())
+        except ValueError:
+            forms.alert("Invalid number: {}".format(custom_str), ok=True)
+            script.exit()
+    else:
+        ref_value = confirmed[ref_options.index(ref_chosen) - 2]["value"]
+
+    if ref_value != 0.0:
+        for pt in confirmed:
+            pt["value"] = pt["value"] - ref_value
+
     ground = find_ground_level(doc)
     if ground:
         use_ground = forms.alert(
