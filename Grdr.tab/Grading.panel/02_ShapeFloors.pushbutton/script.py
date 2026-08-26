@@ -9,12 +9,283 @@ clr.AddReference("System.Xml")
 from pyrevit import forms, script
 from Autodesk.Revit.DB import (
     Transaction, XYZ, Floor, Toposolid,
-    BuiltInParameter, Options, Level
+    BuiltInParameter, Options,
+    ReferenceIntersector, FindReferenceTarget,
+    View3D
 )
 from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
 
 doc   = __revit__.ActiveUIDocument.Document
 uidoc = __revit__.ActiveUIDocument
+M_TO_FT = 3.28084
+
+def get_3d_view():
+    view = doc.ActiveView
+    if isinstance(view, View3D):
+        return view
+    from Autodesk.Revit.DB import FilteredElementCollector
+    for v in FilteredElementCollector(doc).OfClass(View3D).ToElements():
+        if not v.IsTemplate:
+            return v
+    return None
+
+def get_family_type_name(element):
+    try:
+        type_id = element.GetTypeId()
+        etype   = doc.GetElement(type_id)
+        fam = etype.get_Parameter(BuiltInParameter.SYMBOL_FAMILY_NAME_PARAM).AsString()
+        typ = etype.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM).AsString()
+        return "{}: {}".format(fam, typ)
+    except:
+        return "Unknown"
+
+def is_flat(element):
+    try:
+        sse = element.SlabShapeEditor
+        if sse is None:
+            return True
+        return sse.SlabShapeCreaseArray.Size == 0
+    except:
+        return True
+
+def flatten_element(element):
+    try:
+        sse = element.SlabShapeEditor
+        if sse is not None:
+            sse.ResetSlabShape()
+    except:
+        pass
+
+def get_topo_z(intersector, x, y, search_z):
+    """Shoot ray down from search_z, return Z of TOP face (first hit = highest Z)."""
+    try:
+        results = intersector.Find(XYZ(x, y, search_z), XYZ(0, 0, -1))
+        if results and results.Count > 0:
+            # FIRST hit is the top surface face (closest to ray origin = topmost)
+            first = results[0]
+            return search_z - first.Proximity
+    except:
+        pass
+    return None
+
+def shape_element(element, intersector, offset_m, match_method,
+                  reset_first, grid_steps, search_z):
+    offset_ft = offset_m * M_TO_FT
+    sse = element.SlabShapeEditor
+    if sse is None:
+        return False, "SlabShapeEditor not available"
+    try:
+        if reset_first:
+            sse.ResetSlabShape()
+        sse.Enable()
+
+        bb = element.get_BoundingBox(None)
+        if bb is None:
+            return False, "No bounding box"
+
+        steps  = max(2, grid_steps)
+        x_vals = [bb.Min.X + (bb.Max.X - bb.Min.X) * i / float(steps - 1)
+                  for i in range(steps)]
+        y_vals = [bb.Min.Y + (bb.Max.Y - bb.Min.Y) * i / float(steps - 1)
+                  for i in range(steps)]
+
+        placed  = 0
+        skipped = 0
+        for x in x_vals:
+            for y in y_vals:
+                topo_z = get_topo_z(intersector, x, y, search_z)
+                if topo_z is None:
+                    skipped += 1
+                    continue
+                if match_method == "Submerged Half":
+                    z = topo_z - offset_ft / 2.0
+                else:
+                    z = topo_z + offset_ft
+                try:
+                    sse.DrawPoint(XYZ(x, y, z))
+                    placed += 1
+                except:
+                    skipped += 1
+
+        if placed == 0:
+            return False, "No points placed - floor may be outside Toposolid"
+        return True, "Placed:{} Skipped:{}".format(placed, skipped)
+    except Exception:
+        return False, traceback.format_exc()
+
+XAML = """<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Shape Floors" Height="540" Width="520"
+    WindowStartupLocation="CenterScreen"
+    Background="#F5C842" ResizeMode="NoResize">
+  <Window.Resources>
+    <Style TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#111111"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="FontSize" Value="12"/>
+    </Style>
+    <Style TargetType="CheckBox">
+      <Setter Property="Foreground" Value="#111111"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+    </Style>
+    <Style TargetType="ComboBox">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="Foreground" Value="#111111"/>
+      <Setter Property="BorderBrush" Value="#111111"/>
+    </Style>
+    <Style TargetType="Button">
+      <Setter Property="Background" Value="#111111"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Padding" Value="16,6"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="FontWeight" Value="Bold"/>
+      <Setter Property="Cursor" Value="Hand"/>
+    </Style>
+    <Style TargetType="DataGrid">
+      <Setter Property="Background" Value="White"/>
+      <Setter Property="Foreground" Value="#111111"/>
+      <Setter Property="BorderBrush" Value="#111111"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/>
+      <Setter Property="HorizontalGridLinesBrush" Value="#CCCCCC"/>
+      <Setter Property="RowBackground" Value="White"/>
+      <Setter Property="AlternatingRowBackground" Value="#FFF8DC"/>
+    </Style>
+    <Style TargetType="Slider">
+      <Setter Property="Foreground" Value="#111111"/>
+    </Style>
+  </Window.Resources>
+  <Grid Margin="16">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <TextBlock Grid.Row="0" Text="SHAPE FLOORS" FontSize="18"
+               FontWeight="Bold" Margin="0,0,0,16"/>
+    <Grid Grid.Row="1" Margin="0,0,0,12">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="180"/>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="30"/>
+      </Grid.ColumnDefinitions>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+      <TextBlock Grid.Row="0" Grid.Column="0" Text="Reset Existing Shape"
+                 VerticalAlignment="Center" Margin="0,0,0,8"/>
+      <CheckBox x:Name="chkReset" Grid.Row="0" Grid.Column="1"
+                IsChecked="True" VerticalAlignment="Center" Margin="0,0,0,8"/>
+      <TextBlock Grid.Row="1" Grid.Column="0" Text="Grid Density"
+                 VerticalAlignment="Center"/>
+      <Slider x:Name="sldAccuracy" Grid.Row="1" Grid.Column="1"
+              Minimum="2" Maximum="20" Value="5"
+              TickFrequency="1" IsSnapToTickEnabled="True"
+              VerticalAlignment="Center"/>
+      <TextBlock x:Name="lblAccuracy" Grid.Row="1" Grid.Column="2"
+                 VerticalAlignment="Center" Margin="6,0,0,0"/>
+    </Grid>
+    <Grid Grid.Row="2" Margin="0,0,0,12">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="180"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+      <TextBlock Text="Matching Methodology" VerticalAlignment="Center"/>
+      <ComboBox x:Name="cmbMethod" Grid.Column="1">
+        <ComboBoxItem Content="Top To Top" IsSelected="True"/>
+        <ComboBoxItem Content="Bottom To Top"/>
+        <ComboBoxItem Content="Submerged Half"/>
+      </ComboBox>
+    </Grid>
+    <TextBlock Grid.Row="3" Text="OFFSET PER FAMILY TYPE (metres)"
+               FontWeight="Bold" Margin="0,0,0,6"/>
+    <DataGrid x:Name="dgFloors" Grid.Row="4"
+              AutoGenerateColumns="False" CanUserAddRows="False"
+              CanUserDeleteRows="False" HeadersVisibility="Column"
+              Margin="0,0,0,12">
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="Family Type" Binding="{Binding FamilyType}"
+                            Width="*" IsReadOnly="True"/>
+        <DataGridTextColumn Header="Offset (m)" Binding="{Binding Offset}"
+                            Width="100"/>
+      </DataGrid.Columns>
+    </DataGrid>
+    <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button x:Name="btnCancel" Content="Cancel" Margin="0,0,8,0"
+              Background="White" Foreground="#111111"/>
+      <Button x:Name="btnOk" Content="OK"/>
+    </StackPanel>
+  </Grid>
+</Window>"""
+
+class FloorRow(object):
+    def __init__(self, family_type):
+        self.FamilyType = family_type
+        self.Offset     = "0.00"
+
+class ShapeFloorsDialog(object):
+    def __init__(self, floor_types):
+        self.result = None
+        self._build(floor_types)
+
+    def _build(self, floor_types):
+        from System.Xml import XmlReader
+        from System.IO import StringReader
+        from System.Windows.Markup import XamlReader
+        reader   = XmlReader.Create(StringReader(XAML))
+        self.win = XamlReader.Load(reader)
+
+        self.chk_reset = self.win.FindName("chkReset")
+        self.sld       = self.win.FindName("sldAccuracy")
+        self.lbl_acc   = self.win.FindName("lblAccuracy")
+        self.cmb       = self.win.FindName("cmbMethod")
+        self.dg        = self.win.FindName("dgFloors")
+        btn_ok         = self.win.FindName("btnOk")
+        btn_cancel     = self.win.FindName("btnCancel")
+
+        self.lbl_acc.Text = "5"
+        self.sld.ValueChanged += self._on_slider
+
+        from System.Collections.ObjectModel import ObservableCollection
+        self.items = ObservableCollection[object]()
+        for ft in floor_types:
+            self.items.Add(FloorRow(ft))
+        self.dg.ItemsSource = self.items
+
+        btn_ok.Click     += self._on_ok
+        btn_cancel.Click += self._on_cancel
+
+    def _on_slider(self, s, e):
+        self.lbl_acc.Text = str(int(self.sld.Value))
+
+    def _on_ok(self, s, e):
+        offsets = {}
+        for item in self.items:
+            try:
+                val = float(str(item.Offset).strip() or "0")
+            except:
+                val = 0.0
+            offsets[item.FamilyType] = val
+        self.result = {
+            "reset":    bool(self.chk_reset.IsChecked),
+            "accuracy": int(self.sld.Value),
+            "method":   str(self.cmb.Text),
+            "offsets":  offsets
+        }
+        self.win.Close()
+
+    def _on_cancel(self, s, e):
+        self.result = None
+        self.win.Close()
+
+    def show(self):
+        self.win.ShowDialog()
+        return self.result
 
 class ToposolidFilter(ISelectionFilter):
     def AllowElement(self, e):
@@ -22,122 +293,117 @@ class ToposolidFilter(ISelectionFilter):
     def AllowReference(self, r, p):
         return False
 
-class FloorFilter(ISelectionFilter):
+class FloorOrTopoFilter(ISelectionFilter):
     def AllowElement(self, e):
-        return isinstance(e, Floor)
+        return isinstance(e, Floor) or isinstance(e, Toposolid)
     def AllowReference(self, r, p):
         return False
 
-def build_topo_mesh(topo):
-    opt = Options()
-    opt.ComputeReferences = False
-    opt.IncludeNonVisibleObjects = False
-    triangles = []
-    try:
-        geom = topo.get_Geometry(opt)
-        for obj in geom:
-            try:
-                for face in obj.Faces:
-                    try:
-                        mesh = face.Triangulate()
-                        if mesh is None:
-                            continue
-                        for i in range(mesh.NumTriangles):
-                            tri = mesh.get_Triangle(i)
-                            triangles.append((
-                                tri.get_Vertex(0),
-                                tri.get_Vertex(1),
-                                tri.get_Vertex(2)
-                            ))
-                    except:
-                        continue
-            except:
-                continue
-    except:
-        pass
-    return triangles
-
-def interpolate_z_detailed(triangles, x, y):
-    best_z    = None
-    best_dist = float('inf')
-    hits      = 0
-    for (v0, v1, v2) in triangles:
-        denom = ((v1.Y - v2.Y)*(v0.X - v2.X) +
-                 (v2.X - v1.X)*(v0.Y - v2.Y))
-        if abs(denom) < 1e-9:
-            continue
-        a = ((v1.Y - v2.Y)*(x - v2.X) +
-             (v2.X - v1.X)*(y - v2.Y)) / denom
-        b = ((v2.Y - v0.Y)*(x - v2.X) +
-             (v0.X - v2.X)*(y - v2.Y)) / denom
-        c = 1.0 - a - b
-        if a >= -0.01 and b >= -0.01 and c >= -0.01:
-            hits += 1
-            return a*v0.Z + b*v1.Z + c*v2.Z, "barycentric"
-        cx = (v0.X + v1.X + v2.X) / 3.0
-        cy = (v0.Y + v1.Y + v2.Y) / 3.0
-        dist = (cx - x)**2 + (cy - y)**2
-        if dist < best_dist:
-            best_dist = dist
-            best_z    = (v0.Z + v1.Z + v2.Z) / 3.0
-    return best_z, "FALLBACK dist={:.1f}ft".format(best_dist**0.5)
-
 try:
-    forms.alert("Select SOURCE Toposolid.", title="XY Audit", ok=True)
+    view_3d = get_3d_view()
+    if view_3d is None:
+        forms.alert("No 3D view found.", title="Shape Floors", ok=True)
+        script.exit()
+
+    forms.alert("Select the SOURCE Toposolid (grading surface).",
+                title="Shape Floors", ok=True)
     try:
         topo_ref  = uidoc.Selection.PickObject(ObjectType.Element,
-                                               ToposolidFilter(), "Select Toposolid")
+                                               ToposolidFilter(),
+                                               "Select source Toposolid")
         topo_elem = doc.GetElement(topo_ref.ElementId)
     except:
         script.exit()
 
-    forms.alert("Select TARGET floors.", title="XY Audit", ok=True)
+    forms.alert("Now select TARGET floors to shape.\nHold Ctrl for multiple.",
+                title="Shape Floors", ok=True)
     try:
-        floor_refs  = uidoc.Selection.PickObjects(ObjectType.Element,
-                                                  FloorFilter(), "Select floors")
-        floor_elems = [doc.GetElement(r.ElementId) for r in floor_refs]
+        target_refs  = uidoc.Selection.PickObjects(ObjectType.Element,
+                                                   FloorOrTopoFilter(),
+                                                   "Select target floors")
+        target_elems = [doc.GetElement(r.ElementId) for r in target_refs]
     except:
         script.exit()
 
-    triangles = build_topo_mesh(topo_elem)
-    z_all = [v.Z for tri in triangles for v in tri]
-    x_all = [v.X for tri in triangles for v in tri]
-    y_all = [v.Y for tri in triangles for v in tri]
+    if not target_elems:
+        forms.alert("No elements selected.", ok=True)
+        script.exit()
 
-    log = [
-        "XY BOUNDS AUDIT",
-        "Topo X: {:.1f} to {:.1f}ft".format(min(x_all), max(x_all)),
-        "Topo Y: {:.1f} to {:.1f}ft".format(min(y_all), max(y_all)),
-        "Topo Z: {:.3f} to {:.3f}ft".format(min(z_all), max(z_all)),
-        "Triangles: {}".format(len(triangles)),
+    intersector = ReferenceIntersector(
+        topo_elem.Id, FindReferenceTarget.Face, view_3d)
+    intersector.FindReferencesInRevitLinks = False
+
+    topo_bb  = topo_elem.get_BoundingBox(None)
+    search_z = topo_bb.Max.Z + 10.0 if topo_bb else 100.0
+
+    not_flat = [e for e in target_elems if not is_flat(e)]
+    if not_flat:
+        names    = "\n".join([get_family_type_name(e) for e in not_flat])
+        response = forms.alert(
+            "{} element(s) already shaped:\n{}\n\nFlatten before shaping?".format(
+                len(not_flat), names),
+            title="Shape Floors", yes=True, no=True)
+        if response:
+            with Transaction(doc, "TLA - Flatten") as t:
+                t.Start()
+                for e in not_flat:
+                    flatten_element(e)
+                t.Commit()
+        else:
+            target_elems = [e for e in target_elems if e not in not_flat]
+            if not target_elems:
+                forms.alert("No flat elements remaining.", ok=True)
+                script.exit()
+
+    type_map = {}
+    for e in target_elems:
+        ft = get_family_type_name(e)
+        if ft not in type_map:
+            type_map[ft] = []
+        type_map[ft].append(e)
+
+    dlg    = ShapeFloorsDialog(sorted(type_map.keys()))
+    result = dlg.show()
+    if result is None:
+        script.exit()
+
+    grid_steps = result["accuracy"]
+    log_lines  = [
+        "Shape Floors Log",
+        "Method: ReferenceIntersector (first hit = top face)",
+        "Search Z: {:.3f}ft".format(search_z),
+        "Grid density: {}x{}".format(grid_steps, grid_steps),
         ""
     ]
 
-    for floor in floor_elems:
-        try:
-            bb   = floor.get_BoundingBox(None)
-            fxmn = bb.Min.X
-            fxmx = bb.Max.X
-            fymn = bb.Min.Y
-            fymx = bb.Max.Y
-            cx   = (fxmn + fxmx) / 2.0
-            cy   = (fymn + fymx) / 2.0
-            xov  = fxmx >= min(x_all) and fxmn <= max(x_all)
-            yov  = fymx >= min(y_all) and fymn <= max(y_all)
-            tz, method = interpolate_z_detailed(triangles, cx, cy)
-            log.append("Floor id={}".format(floor.Id))
-            log.append("  Floor X: {:.1f} to {:.1f}".format(fxmn, fxmx))
-            log.append("  Floor Y: {:.1f} to {:.1f}".format(fymn, fymx))
-            log.append("  Centre: ({:.1f}, {:.1f})".format(cx, cy))
-            log.append("  Overlaps topo: X={} Y={}".format(xov, yov))
-            log.append("  Topo Z: {:.4f}ft via {}".format(
-                tz if tz is not None else -9999, method))
-            log.append("")
-        except Exception:
-            log.append("Floor {}: ERROR\n{}".format(
-                floor.Id, traceback.format_exc()))
+    errors  = []
+    success = 0
+    with Transaction(doc, "TLA Grading - Shape Floors") as t:
+        t.Start()
+        for ft, elements in type_map.items():
+            offset_m = result["offsets"].get(ft, 0.0)
+            for elem in elements:
+                bb = elem.get_BoundingBox(None)
+                cx = (bb.Min.X + bb.Max.X) / 2.0 if bb else 0
+                cy = (bb.Min.Y + bb.Max.Y) / 2.0 if bb else 0
+                sample_z = get_topo_z(intersector, cx, cy, search_z)
+                log_lines.append(
+                    "  {} | offset={}m | centre_z={}ft".format(
+                        ft, offset_m,
+                        "{:.4f}".format(sample_z) if sample_z is not None else "NO HIT"))
+                ok, msg = shape_element(
+                    elem, intersector, offset_m,
+                    result["method"], result["reset"],
+                    grid_steps, search_z)
+                log_lines.append("    -> {}".format(msg))
+                if ok:
+                    success += 1
+                else:
+                    errors.append("{}: {}".format(ft, msg))
+        t.Commit()
 
-    forms.alert("\n".join(log), title="XY Audit", ok=True)
+    log_lines.append("\nShaped: {} | Errors: {}".format(success, len(errors)))
+    forms.alert("\n".join(log_lines), title="Shape Floors - Done", ok=True)
 
 except Exception:
     forms.alert(traceback.format_exc(), title="ERROR", ok=True)
