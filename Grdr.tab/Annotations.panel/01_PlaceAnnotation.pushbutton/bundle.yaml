@@ -1,0 +1,3 @@
+﻿title: Place Annotation
+tooltip: Place Spot Elevation annotations on selected elements. Supports FFL, TOW, FSL, TOS, TOR, TOK, FRL, WL, BL prefixes with automatic classification.
+author: edtrafc
